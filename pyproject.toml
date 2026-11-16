@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mesospim-virtual-zarr"
+version = "0.1.0"
+description = "Read-only, on-demand OME-Zarr 0.5 (Zarr v3) mosaic from OME-Zarr 0.4 (Zarr v2) tiles"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "zarr>=3.1,<4",
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "httpx>=0.24", "numcodecs>=0.13"]
+
+[project.scripts]
+mesospim-virtual-zarr = "virtual_mesospim.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
