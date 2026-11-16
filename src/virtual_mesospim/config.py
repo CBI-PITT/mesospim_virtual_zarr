@@ -5,6 +5,40 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Optional
+import re
+
+
+NAMED_COLORS = {
+    "red": (1.0, 0.0, 0.0),
+    "green": (0.0, 1.0, 0.0),
+    "blue": (0.0, 0.0, 1.0),
+    "magenta": (1.0, 0.0, 1.0),
+    "cyan": (0.0, 1.0, 1.0),
+    "yellow": (1.0, 1.0, 0.0),
+    "white": (1.0, 1.0, 1.0),
+    "gray": (1.0, 1.0, 1.0),
+    "grey": (1.0, 1.0, 1.0),
+}
+
+
+def color_to_rgb(color: str) -> tuple[float, float, float]:
+    """Named color or #RGB/#RRGGBB hex to (r, g, b) floats in [0, 1]."""
+    if color.lower() in NAMED_COLORS:
+        return NAMED_COLORS[color.lower()]
+    hex_part = color[1:] if color.startswith("#") else color
+    if re.fullmatch(r"[0-9a-fA-F]{6}", hex_part):
+        return tuple(int(hex_part[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    if re.fullmatch(r"[0-9a-fA-F]{3}", hex_part):
+        return tuple(int(c * 2, 16) / 255.0 for c in hex_part)
+    raise ValueError(f"Invalid color: {color!r}")
+
+
+def _is_valid_color(color: str) -> bool:
+    try:
+        color_to_rgb(color)
+        return True
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -23,6 +57,8 @@ class MosaicConfig:
     max_concurrent_chunks: int = 4
     name: str = "MesoSPIM virtual mosaic"
     mount_path: str = "stitched.ome.zarr"
+    channel: Optional[str] = None  # set for multi-channel manifests; mounted at /<mount_path>/<channel>
+    color: Optional[str] = None  # optional display color for the Neuroglancer layer
 
     def __post_init__(self) -> None:
         if self.rows < 1 or self.cols < 1:
@@ -51,21 +87,73 @@ class MosaicConfig:
             raise ValueError("max_concurrent_chunks must be >= 1")
         if not self.mount_path or "/" in self.mount_path or self.mount_path in (".", ".."):
             raise ValueError("mount_path must be a single URL path segment")
+        if self.channel is not None and (
+            not self.channel or "/" in self.channel or self.channel in (".", "..")
+        ):
+            raise ValueError("channel must be a single URL path segment")
+        if self.color is not None and not _is_valid_color(self.color):
+            raise ValueError("color must be a named color (e.g. green, magenta) or #RGB/#RRGGBB hex")
 
     @classmethod
     def from_json(cls, file_path: str | Path) -> "MosaicConfig":
-        file_path = Path(file_path).resolve()
-        cfg = json.loads(file_path.read_text(encoding="utf-8"))
-        # Allow relative paths in JSON, interpreted relative to the manifest.
-        cfg["tiles"] = tuple(
-            (Path(p).expanduser() if Path(p).expanduser().is_absolute()
-             else file_path.parent / Path(p).expanduser()).resolve()
-            for p in cfg["tiles"]
-        )
-        for name in ("overlap_yx", "chunk_shape_zyx"):
-            if name in cfg:
-                cfg[name] = tuple(cfg[name])
-        if cfg.get("positions_zyx") is not None:
-            cfg["positions_zyx"] = tuple(tuple(v for v in position)
-                                          for position in cfg["positions_zyx"])
-        return cls(**cfg)
+        configs = load_mosaic_configs(file_path)
+        if len(configs) != 1:
+            raise ValueError("Multi-channel manifest; use load_mosaic_configs")
+        return configs[0]
+
+
+def _resolve_tiles(raw_tiles, manifest_path: Path) -> tuple[Path, ...]:
+    # Allow relative paths in JSON, interpreted relative to the manifest.
+    return tuple(
+        (Path(p).expanduser() if Path(p).expanduser().is_absolute()
+         else manifest_path.parent / Path(p).expanduser()).resolve()
+        for p in raw_tiles
+    )
+
+
+def _prepare_common(cfg: dict) -> dict:
+    for key in ("overlap_yx", "chunk_shape_zyx"):
+        if key in cfg:
+            cfg[key] = tuple(cfg[key])
+    if cfg.get("positions_zyx") is not None:
+        cfg["positions_zyx"] = tuple(tuple(v for v in position)
+                                     for position in cfg["positions_zyx"])
+    return cfg
+
+
+def load_mosaic_configs(file_path: str | Path) -> "list[MosaicConfig]":
+    """Load one MosaicConfig per channel. Manifests with a top-level tiles list
+    yield a single config; manifests with a channels list yield one config per
+    channel sharing all geometry settings."""
+    file_path = Path(file_path).resolve()
+    cfg = json.loads(file_path.read_text(encoding="utf-8"))
+    if "channels" in cfg:
+        if "tiles" in cfg:
+            raise ValueError("Provide either tiles (single channel) or channels, not both")
+        channels = cfg.pop("channels")
+        if not isinstance(channels, list) or not channels:
+            raise ValueError("channels must be a non-empty list")
+        entries = []
+        for entry in channels:
+            if not isinstance(entry, dict) or "name" not in entry or "tiles" not in entry:
+                raise ValueError("Each channels entry needs name and tiles")
+            name = entry["name"]
+            if not isinstance(name, str) or not name or "/" in name or name in (".", ".."):
+                raise ValueError(f"Invalid channel name: {name!r}")
+            entry = dict(entry)
+            name = entry.pop("name")
+            tiles = _resolve_tiles(entry.pop("tiles"), file_path)
+            color = entry.pop("color", None)
+            merged = {**cfg, **entry}
+            merged["tiles"] = tiles
+            merged["channel"] = name
+            merged["color"] = color
+            merged["name"] = f"{merged['name']} {name}" if merged.get("name") else name
+            entries.append(MosaicConfig(**_prepare_common(merged)))
+        if len({e.channel for e in entries}) != len(entries):
+            raise ValueError("Channel names must be unique")
+        return entries
+    if "tiles" not in cfg:
+        raise ValueError("Manifest needs a tiles list or a channels list")
+    cfg["tiles"] = _resolve_tiles(cfg["tiles"], file_path)
+    return [MosaicConfig(**_prepare_common(cfg))]

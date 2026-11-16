@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 import numpy as np
 
-from .config import MosaicConfig
+from .config import MosaicConfig, color_to_rgb, load_mosaic_configs
 from .engine import VirtualMosaic
 
 
@@ -50,27 +50,48 @@ def _view_hints(mosaic: VirtualMosaic) -> tuple[tuple[float, float] | None, list
         return None, None
 
 
-def _neuroglancer_url(mosaic: VirtualMosaic, source: str) -> str:
-    """Viewer URL for the hosted demo app with the mosaic layer preloaded."""
-    level = mosaic.levels[0]
-    names = mosaic.axis_names[-3:]
+def _layer_source(mosaic: VirtualMosaic, host: str, port: int) -> str:
+    base = f"http://{host}:{port}/{mosaic.config.mount_path}"
+    if mosaic.config.channel:
+        base += f"/{mosaic.config.channel}"
+    return f"{base}/|zarr3:"
+
+
+def _color_shader(rgb: tuple[float, float, float]) -> str:
+    r, g, b = rgb
+    return ("#uicontrol invlerp normalized\n"
+            "void main() { float v = normalized(); "
+            f"emitRGB(vec3({r} * v, {g} * v, {b} * v)); }}")
+
+
+def _neuroglancer_url(mosaics: list[VirtualMosaic], host: str, port: int) -> str:
+    """Viewer URL for the hosted demo app with one image layer per channel."""
+    first = mosaics[0]
+    level = first.levels[0]
+    names = first.axis_names[-3:]
     scale_um = level.scale[-3:]
     shape = level.shape[-3:]
+    layers = []
+    opacity = 0.7 if len(mosaics) > 1 else 1
+    for mosaic in mosaics:
+        layer = {"type": "image", "name": mosaic.config.name,
+                 "source": _layer_source(mosaic, host, port), "opacity": opacity}
+        if mosaic.config.color:
+            layer["shader"] = _color_shader(color_to_rgb(mosaic.config.color))
+        window, _ = _view_hints(mosaic)
+        if window is not None:
+            layer["shaderControls"] = {"normalized": {"range": list(window)}}
+        layers.append(layer)
+    _, position = _view_hints(first)
     state = {
         "dimensions": {name: [s * 1e-6, "m"] for name, s in zip(names, scale_um)},
-        "position": [size / 2 for size in shape],
+        "position": position if position is not None else [size / 2 for size in shape],
         "crossSectionScale": max(1.0, max(size * s for size, s in zip(shape, scale_um))
                                  / max(scale_um) / 800),
-        "layers": [{"type": "image", "name": mosaic.config.name,
-                    "source": source, "opacity": 1}],
-        "selectedLayer": {"layer": mosaic.config.name},
+        "layers": layers,
+        "selectedLayer": {"layer": layers[0]["name"]},
         "layout": "4panel",
     }
-    window, position = _view_hints(mosaic)
-    if position is not None:
-        state["position"] = position
-    if window is not None:
-        state["layers"][0]["shaderControls"] = {"normalized": {"range": list(window)}}
     return f"{NEUROGLANCER_APP}#!{quote(json.dumps(state, separators=(',', ':')), safe='')}"
 
 
@@ -82,20 +103,27 @@ def main(argv=None) -> None:
     parser.add_argument("--inspect", action="store_true", help="Validate manifest and print geometry; do not run server")
     args = parser.parse_args(argv)
 
-    config = MosaicConfig.from_json(args.config)
-    mosaic = VirtualMosaic(config)
-    print(json.dumps(mosaic.describe(), indent=2))
+    configs = load_mosaic_configs(args.config)
+    mosaics = [VirtualMosaic(config) for config in configs]
+    if len(mosaics) == 1:
+        print(json.dumps(mosaics[0].describe(), indent=2))
+    else:
+        print(json.dumps([mosaic.describe() for mosaic in mosaics], indent=2))
     if args.inspect:
         return
 
     from .http import create_app
     import uvicorn
     host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
-    source = f"http://{host}:{args.port}/{config.mount_path}/|zarr3:"
-    print(f"Virtual store: http://{host}:{args.port}/{config.mount_path}/")
-    print(f"Neuroglancer link: {_neuroglancer_url(mosaic, source)}")
-    print(f"Layer source: {source}")
-    uvicorn.run(create_app(mosaic), host=args.host, port=args.port, workers=1)
+    mount = mosaics[0].config.mount_path
+    print(f"Virtual store: http://{host}:{args.port}/{mount}/"
+          + (f"  (channels: {', '.join(m.config.channel for m in mosaics if m.config.channel)})"
+             if len(mosaics) > 1 else ""))
+    print(f"Neuroglancer link: {_neuroglancer_url(mosaics, host, args.port)}")
+    for mosaic in mosaics:
+        label = mosaic.config.channel or mosaic.config.name
+        print(f"Layer source ({label}): {_layer_source(mosaic, host, args.port)}")
+    uvicorn.run(create_app(mosaics), host=args.host, port=args.port, workers=1)
 
 
 if __name__ == "__main__":

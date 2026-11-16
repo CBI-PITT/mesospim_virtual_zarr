@@ -10,6 +10,8 @@ It includes:
 - `VirtualMosaic` — tile geometry, multiscale transforms and chunk compositing
 - `VirtualZarrV3Store` — native read-only Zarr-Python 3 `Store` implementation
 - FastAPI server — serves the exact same virtual keys to Neuroglancer via HTTP
+- Multi-channel manifests: one virtual mosaic per channel, one colored
+  Neuroglancer layer per channel with per-channel display windows
 - Col-major tile numbering: `tile_index = col * rows + row`
 - Automatic grid offsets from fractional tile overlaps; manual integer positions
 - `first`, `last`, or `feather` overlap policy; normalized feather blending
@@ -85,9 +87,43 @@ Path('my_mosaic.json').write_text(json.dumps(config, indent=2))
 
 **For multi-channel acquisitions:** this version can serve `CZYX` or `TCZYX`
 source arrays, preserving an existing channel dimension. If each wavelength is
-in a *separate* OME-Zarr tile, run one virtual mosaic per channel/manifest; you
-can add each mosaic as a separate Neuroglancer layer. Merging separate channel
-stores into a newly synthesized channel dimension is not yet implemented.
+in a *separate* OME-Zarr tile, list the channels in one manifest: give `tiles`
+as a dict keyed by channel, add a `channels` list with per-channel `name` and
+optional `color` (`"green"`, `"red"`, `"#RRGGBB"`, ...), and the server mounts
+one virtual mosaic per channel under the base mount:
+
+```json
+{
+  "tiles": {
+    "Ch488": ["path/to/Mag4_Tile0_Ch488.ome.zarr", "..."],
+    "Ch561": ["path/to/Mag4_Tile0_Ch561.ome.zarr", "..."]
+  },
+  "rows": 4,
+  "cols": 3,
+  "channels": [
+    {"channel": "Ch488", "name": "MesoSPIM virtual stitched Ch488", "color": "green"},
+    {"channel": "Ch561", "name": "MesoSPIM virtual stitched Ch561", "color": "red"}
+  ],
+  "overlap_yx": [0.10, 0.10],
+  "chunk_shape_zyx": [32, 256, 256],
+  "blend": "feather",
+  "gzip_level": 0,
+  "cache_chunks": 8,
+  "max_concurrent_chunks": 4,
+  "mount_path": "stitched.ome.zarr"
+}
+```
+
+All channels must share rows, cols, grid geometry and per-tile paths except the
+channel-discriminating part of the filename. Requests then look like
+`GET http://127.0.0.1:8080/stitched.ome.zarr/Ch488/0/zarr.json`, and the printed
+Neuroglancer link opens one image layer per channel with the per-channel color
+and display window (layers blend at 0.7 opacity so the channels overlay). Each
+layer can also be added manually with its per-channel source URL:
+
+```text
+http://127.0.0.1:8080/stitched.ome.zarr/Ch488/|zarr3:
+```
 
 ## 3. Inspect geometry (does not load the tile image pixels)
 

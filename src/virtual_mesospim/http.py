@@ -39,13 +39,16 @@ class PrivateNetworkAccessMiddleware:
         await self.app(scope, receive, send)
 
 
-def create_app(mosaic: VirtualMosaic) -> FastAPI:
-    """HTTP endpoints implement Zarr v3 keys at /<mount_path>/<key>.
+def create_app(mosaics: VirtualMosaic | list[VirtualMosaic]) -> FastAPI:
+    """HTTP endpoints implement Zarr v3 keys at /<mount_path>/<key> per mosaic,
+    or /<mount_path>/<channel>/<key> for multi-channel manifests.
 
     CORS is intentionally broad so a hosted Neuroglancer can fetch data.
     Do NOT expose this server publicly with private microscopy data unless
     appropriate authentication, HTTPS and CORS access control are configured.
     """
+    if isinstance(mosaics, VirtualMosaic):
+        mosaics = [mosaics]
     app = FastAPI(title="Virtual MesoSPIM OME-Zarr 0.5", docs_url=None, redoc_url=None)
     app.add_middleware(
         CORSMiddleware,
@@ -57,17 +60,18 @@ def create_app(mosaic: VirtualMosaic) -> FastAPI:
     # Added last so it wraps (and can augment) CORSMiddleware preflight responses.
     app.add_middleware(PrivateNetworkAccessMiddleware)
 
-    limiter = asyncio.Semaphore(mosaic.config.max_concurrent_chunks)
-
     @app.get("/healthz")
     def healthz():
-        return {"status": "ok", "levels": len(mosaic.levels)}
+        return {"status": "ok",
+                "mosaics": [{"channel": m.config.channel, "levels": len(m.levels)}
+                            for m in mosaics]}
 
     @app.get("/info")
     def info():
-        return JSONResponse(mosaic.describe())
+        return JSONResponse([m.describe() for m in mosaics])
 
-    async def serve_key(key: str, request: Request):
+    async def serve_key(mosaic: VirtualMosaic, limiter: asyncio.Semaphore,
+                        key: str, request: Request):
         if not mosaic.has_key(key):
             raise HTTPException(status_code=404, detail="No such virtual Zarr key")
         try:
@@ -111,9 +115,19 @@ def create_app(mosaic: VirtualMosaic) -> FastAPI:
                         status_code=status, media_type=media_type,
                         headers={**headers, "Content-Length": str(len(content))})
 
-    # Register *only* the Zarr namespace. Arbitrary filesystem paths are never used.
-    @app.api_route(f"/{mosaic.config.mount_path}/{{key:path}}", methods=["GET", "HEAD"])
-    async def zarr_key(key: str, request: Request):
-        return await serve_key(key, request)
+    # Register *only* the Zarr namespaces. Arbitrary filesystem paths are never used.
+    for mosaic in mosaics:
+        limiter = asyncio.Semaphore(mosaic.config.max_concurrent_chunks)
+        base = f"/{mosaic.config.mount_path}"
+        if mosaic.config.channel:
+            base += f"/{mosaic.config.channel}"
+
+        def register(mosaic=mosaic, limiter=limiter, base=base):
+            @app.api_route(f"{base}/{{key:path}}", methods=["GET", "HEAD"])
+            async def zarr_key(key: str, request: Request,
+                               mosaic=mosaic, limiter=limiter):
+                return await serve_key(mosaic, limiter, key, request)
+
+        register()
 
     return app

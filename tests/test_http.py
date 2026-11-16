@@ -61,4 +61,36 @@ def test_http_private_network_access_preflight():
 
     asyncio.run(run())
 
+
+def test_http_multichannel_mounting():
+    m488 = build(channel='Ch488')
+    m561 = build(channel='Ch561')
+    app = create_app([m488, m561])
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            for ch in ('Ch488', 'Ch561'):
+                meta = await client.get(f'/stitched.ome.zarr/{ch}/zarr.json')
+                assert meta.status_code == 200
+                assert meta.json()['attributes']['ome']['version'] == '0.5'
+                chunk = await client.get(f'/stitched.ome.zarr/{ch}/0/c/0/0/0/0/0')
+                assert chunk.status_code == 200
+            # The parent namespace is not served when channels are mounted.
+            assert (await client.get('/stitched.ome.zarr/zarr.json')).status_code == 404
+            assert (await client.get('/stitched.ome.zarr/Ch488/zarr.json')).status_code == 200
+            health = (await client.get('/healthz')).json()
+            assert health['status'] == 'ok'
+            assert [m['channel'] for m in health['mosaics']] == ['Ch488', 'Ch561']
+            assert len((await client.get('/info')).json()) == 2
+            preflight = await client.options(
+                '/stitched.ome.zarr/Ch488/zarr.json',
+                headers={'Origin': 'https://neuroglancer-demo.appspot.com',
+                         'Access-Control-Request-Method': 'GET',
+                         'Access-Control-Private-Network-Request': 'true'})
+            assert preflight.status_code == 200
+            assert preflight.headers['access-control-allow-private-network'] == 'true'
+
+    asyncio.run(run())
+
     asyncio.run(run())
