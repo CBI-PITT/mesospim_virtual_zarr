@@ -101,8 +101,11 @@ class VirtualMosaic:
             groups = []
             for path in config.tiles:
                 try:
-                    # zarr-python 3 transparently reads legacy Zarr v2 arrays.
-                    groups.append(zarr.open_group(str(path), mode="r", zarr_format=2))
+                    try:
+                        groups.append(zarr.open_group(str(path), mode="r", zarr_format=2))
+                    except TypeError:
+                        # Zarr-Python 2 has no zarr_format argument; it reads v2 natively.
+                        groups.append(zarr.open_group(str(path), mode="r"))
                 except Exception as exc:
                     raise ValueError(f"Cannot open tile as a Zarr v2 group: {path}") from exc
         if len(groups) != len(config.tiles):

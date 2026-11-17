@@ -9,7 +9,8 @@ description = "Read-only, on-demand OME-Zarr 0.5 (Zarr v3) mosaic from OME-Zarr 
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
-    "zarr>=3.1,<4",
+    "zarr>=2.18.3,<3; python_version < '3.11'",
+    "zarr>=3.1,<4; python_version >= '3.11'",
     "fastapi>=0.100",
     "uvicorn>=0.23",
 ]
@@ -19,6 +20,7 @@ test = ["pytest>=7", "httpx>=0.24", "numcodecs>=0.13"]
 
 [project.scripts]
 mesospim-virtual-zarr = "virtual_mesospim.cli:main"
+mesospim-virtual-zarr-to-ims = "virtual_mesospim.export_ims:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

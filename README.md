@@ -1,15 +1,16 @@
 # MesoSPIM virtual OME-Zarr v3 mosaic (prototype v0.1)
 
-This is a **read-only virtual image**, not an offline stitching/export tool. It reads
-original **OME-Zarr 0.4 / Zarr v2 tile stores** and serves a new **OME-Zarr 0.5 /
-Zarr v3** namespace over HTTP. It does **not** overwrite, modify, or duplicate
-source Zarr tile files. Only requested output chunks are assembled in RAM.
+This is a **read-only virtual image** of original **OME-Zarr 0.4 / Zarr v2 tile
+stores**, exposed as an **OME-Zarr 0.5 / Zarr v3** namespace over HTTP or in
+Python. An optional exporter streams the stitched image into an Imaris file.
+The source Zarr tile files are never modified; output chunks are assembled in RAM.
 
 It includes:
 
 - `VirtualMosaic` — tile geometry, multiscale transforms and chunk compositing
 - `VirtualZarrV3Store` — native read-only Zarr-Python 3 `Store` implementation
 - FastAPI server — serves the exact same virtual keys to Neuroglancer via HTTP
+- Imaris exporter — writes one IMS from the same virtual compositing engine without a server
 - Multi-channel manifests: one virtual mosaic per channel, one colored
   Neuroglancer layer per channel with per-channel display windows
 - Col-major tile numbering: `tile_index = col * rows + row`
@@ -32,8 +33,12 @@ python -m pip install -e '.[test]'
 If using micromamba / conda, activate your environment, and run the same
 `pip install -e '.[test]'` command. Tested logic is Python 3.10+ compatible.
 
-**Note:** The distribution needs Zarr-Python **3.x** (which can still *read*
-Zarr v2 stores), not the old Python package `zarr==2.x`.
+**Note:** On Python 3.10, installation uses Zarr-Python **2.18.x** to read the
+original Zarr v2 tiles (including Blosc-compressed tiles). The Zarr 3.0.0a5
+pre-release has a bug decoding compressed v2 tiles. Python 3.11+ uses stable
+Zarr-Python **3.x**. Serving and Imaris export work with either version;
+the optional `VirtualZarrV3Store` Python adapter shown in section 5 requires
+Zarr 3.1+ and therefore Python 3.11+.
 
 ## 2. Describe the source tiles
 
@@ -87,23 +92,19 @@ Path('my_mosaic.json').write_text(json.dumps(config, indent=2))
 
 **For multi-channel acquisitions:** this version can serve `CZYX` or `TCZYX`
 source arrays, preserving an existing channel dimension. If each wavelength is
-in a *separate* OME-Zarr tile, list the channels in one manifest: give `tiles`
-as a dict keyed by channel, add a `channels` list with per-channel `name` and
-optional `color` (`"green"`, `"red"`, `"#RRGGBB"`, ...), and the server mounts
-one virtual mosaic per channel under the base mount:
+in a *separate* OME-Zarr tile, use a `channels` list instead of top-level
+`tiles`. Each entry has a `name`, its own `tiles` list, and an optional `color`
+(`"green"`, `"red"`, `"#RRGGBB"`, ...). The server mounts one virtual mosaic per
+channel under the base mount:
 
 ```json
 {
-  "tiles": {
-    "Ch488": ["path/to/Mag4_Tile0_Ch488.ome.zarr", "..."],
-    "Ch561": ["path/to/Mag4_Tile0_Ch561.ome.zarr", "..."]
-  },
+  "channels": [
+    {"name": "Ch488", "color": "green", "tiles": ["path/to/Mag4_Tile0_Ch488.ome.zarr", "..."]},
+    {"name": "Ch561", "color": "red", "tiles": ["path/to/Mag4_Tile0_Ch561.ome.zarr", "..."]}
+  ],
   "rows": 4,
   "cols": 3,
-  "channels": [
-    {"channel": "Ch488", "name": "MesoSPIM virtual stitched Ch488", "color": "green"},
-    {"channel": "Ch561", "name": "MesoSPIM virtual stitched Ch561", "color": "red"}
-  ],
   "overlap_yx": [0.10, 0.10],
   "chunk_shape_zyx": [32, 256, 256],
   "blend": "feather",
@@ -184,7 +185,8 @@ Never expose private microscopy data to an unauthenticated public endpoint.
 
 ## 5. Read via Zarr-Python 3
 
-You can also read the virtual view *inside Python*, no HTTP server required:
+With Python 3.11+ and Zarr-Python 3.1+, you can also read the virtual view
+*inside Python*, no HTTP server required:
 
 ```python
 import zarr
@@ -204,6 +206,54 @@ small_patch = array[0, 0, 10:12, 100:200, 100:200]  # if input is TCZYX
 The store is deliberately **non-listable**: enumerating billions of virtual
 chunk paths would be expensive. Metadata and exact chunk requests work. Root
 `group.keys()` and directory auto-completion are not available.
+
+## Export a stitched Imaris file (no server required)
+
+Run from the Python environment containing this package and **PyImarisWriter**
+(including its native libraries, as for `mesospim_utils/omezarr_to_ims.py`):
+
+```bash
+mesospim-virtual-zarr-to-ims my_mosaic.json stitched.ims \
+  --reader-threads 8 --writer-threads 16 --max-prefetched-blocks 16
+```
+
+The input is the same JSON manifest used for Neuroglancer. A manifest with a
+`channels` list produces **one IMS file with one output channel per manifest
+channel**, in manifest order. An existing source `C` axis is exported too;
+its channels are flattened into the output channels. For a single-channel
+manifest, one IMS channel is written. The default output is full-resolution
+level `0`, time point `0`; `--level` and `--time-index` select others.
+
+Stitching and blending use `VirtualMosaic.compose_chunk` directly, including
+`positions_zyx`, overlap and `first`/`last`/`feather` behavior. No server, HTTP
+requests or intermediate stitched Zarr are needed. Source data must be `uint16`;
+all output channels must have the same spatial shape, chunk size and scale.
+The writer builds the Imaris resolution pyramid when finishing.
+
+Spatial scale defaults to the selected virtual level's OME-Zarr scale, when
+spatial axis units are micrometers. Otherwise specify
+`--voxel-size-zyx-um Z Y X`. Channel names and colors come from the manifest
+and source OMERO metadata where present; use `--channel-names` and
+`--channel-colors` (one `r,g,b` triple in `[0,1]` per channel) to override them:
+
+```bash
+mesospim-virtual-zarr-to-ims multichannel.json stitched.ims \
+  --channel-names Ch488 Ch561 --channel-colors 0,1,0 1,0,0
+```
+
+Blocks are composed in a bounded reader pool and copied to PyImarisWriter;
+only the configured number of prefetched blocks are held in memory. Output is
+written to `stitched.ims.part` and renamed to `stitched.ims` after successful
+completion. The exporter refuses to replace an existing `.ims`, but removes
+an incomplete `.ims.part` from a previous attempt before retrying and cleans
+up partial output if a run fails.
+
+Each read may decompress an entire **source** Zarr chunk, even if the requested
+output block is much smaller. For source chunks of `256×1500×1500 uint16`,
+that is about 1.07 GiB per concurrent reader; start with
+`--reader-threads 1 --max-prefetched-blocks 2` to limit memory use. Very large
+source chunks may also make the export slow because neighboring output blocks
+can decode the same source chunk repeatedly.
 
 ## 6. Positioning rules
 
@@ -291,8 +341,9 @@ regions can therefore be slower than a fully materialized stitched Zarr.
    nonrigid warping or subpixel interpolation.
 4. Every tile is expected to contain all listed multiscale levels; lower
    resolution levels are *not* generated on demand from level 0.
-5. The output is a live virtual Zarr store accessible via the Python adapter
-   or HTTP. It is **not** an offline, directly openable directory on disk.
+5. The virtual Zarr is accessible via the Python adapter or HTTP, not as an
+   offline, directly openable Zarr directory on disk. Imaris export is available
+   separately using PyImarisWriter.
 6. No cross-process cache sharing. Run one `uvicorn` worker with the provided
    CLI; use a reverse proxy for network security if needed.
 7. This version does not parse nonstandard input axes or source metadata

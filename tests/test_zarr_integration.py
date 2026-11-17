@@ -7,6 +7,9 @@ import numpy as np
 import pytest
 
 zarr = pytest.importorskip('zarr')
+zarr_store = pytest.importorskip('zarr.abc.store')
+if not hasattr(zarr_store, 'ByteRequest'):
+    pytest.skip('The virtual Python Store adapter needs Zarr 3.1 or newer', allow_module_level=True)
 from virtual_mesospim import MosaicConfig, VirtualMosaic
 from virtual_mesospim.store import VirtualZarrV3Store
 
