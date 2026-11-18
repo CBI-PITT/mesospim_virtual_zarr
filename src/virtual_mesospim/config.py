@@ -159,9 +159,17 @@ def _load_gain_file(path: Path, tiles: tuple[Path, ...], channel: Optional[str],
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a JSON object")
     acquisition = data.get("acquisition")
-    if (acquisition is not None and tiles and tiles[0].parent.name != acquisition):
-        raise ValueError(f"{path} acquisition {acquisition!r} does not match tile store "
-                         f"{tiles[0].parent.name!r}")
+    if (acquisition is not None and tiles):
+        tile_store = tiles[0].parent
+        try:
+            # The web app writes the acquisition folder relative to the
+            # manifest, which also handles nested acquisitions.
+            relative_store = tile_store.relative_to(file_path.parent).as_posix()
+        except ValueError:
+            relative_store = tile_store.name
+        if relative_store != acquisition and tile_store.name != acquisition:
+            raise ValueError(f"{path} acquisition {acquisition!r} does not match tile store "
+                             f"{relative_store!r}")
     channels = data.get("channels")
     if not isinstance(channels, list) or not channels:
         raise ValueError(f"{path} needs a non-empty channels list")

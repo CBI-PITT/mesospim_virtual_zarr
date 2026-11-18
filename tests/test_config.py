@@ -176,6 +176,14 @@ def test_gain_json_acquisition_mismatch_rejected(tmp_path):
         load_mosaic_configs(write_manifest(tmp_path, {"tiles": tiles, "rows": 2, "cols": 2}))
 
 
+def test_gain_json_nested_acquisition_path(tmp_path):
+    tiles = [f"acq/scan.ome.zarr/Tile{i}.ome.zarr" for i in range(4)]
+    write_gain_file(tmp_path, {"acquisition": "acq/scan.ome.zarr",
+                               "channels": [{"name": "Ch488", "gains": [1.0] * 4}]})
+    configs = load_mosaic_configs(write_manifest(tmp_path, {"tiles": tiles, "rows": 2, "cols": 2}))
+    assert configs[0].gains == (1.0,) * 4
+
+
 def test_gain_json_invalid_json_rejected(tmp_path):
     tiles = [f"/data/Tile{i}.ome.zarr" for i in range(4)]
     (tmp_path / "gain.json").write_text("{not json", encoding="utf-8")
