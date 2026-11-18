@@ -4,6 +4,13 @@ Spatial mosaicing: column-major indices (tile = col * rows + row).
 No source data or source metadata are altered, and no output chunks are stored.
 
 This first implementation requires pure, axis-aligned *integer* translations.
+Tile z extents may differ across tiles (e.g. one tile with a shorter stack);
+regions above a short tile's top plane that no other tile covers read as fill
+value 0. Time/channel and y/x extents must match exactly across tiles.
+
+Optional per-tile brightness multipliers (auto-discovered gain.json next to the
+manifest, as written by the micro_status brightness page) are applied to each
+tile's pixels before blending; source data are never modified.
 The code intentionally does not claim to reproduce optical registration, rotation,
 subpixel resampling, or physical stage coordinate parsing.
 """
@@ -31,6 +38,16 @@ ALLOWED_DTYPES = {
 def _round_nearest(value: float) -> int:
     """Round halves away from zero; stable for positive and negative positions."""
     return int(math.copysign(math.floor(abs(value) + 0.5), value))
+
+
+def _quantize(values: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    """Round and clip gain-corrected values into the output dtype range."""
+    if dtype.kind in "iu":
+        limits = np.iinfo(dtype)
+        return np.clip(np.rint(values), limits.min, limits.max).astype(dtype)
+    if dtype.kind == "b":
+        return values >= 0.5
+    return values.astype(dtype)
 
 
 def _json_bytes(obj: dict[str, Any]) -> bytes:
@@ -78,6 +95,7 @@ def _transforms(dataset: dict[str, Any], ndim: int) -> tuple[np.ndarray, np.ndar
 class Level:
     sources: tuple[Any, ...]
     tile_shape: tuple[int, ...]
+    tile_shapes: tuple[tuple[int, ...], ...]  # per-tile full shape; z may differ
     shape: tuple[int, ...]
     chunk_shape: tuple[int, ...]
     origins_zyx: tuple[tuple[int, int, int], ...]  # non-negative, normalized
@@ -137,6 +155,8 @@ class VirtualMosaic:
         self.dtype = np.dtype(source_specs[0][0][0].dtype)
         if self.dtype.name not in ALLOWED_DTYPES:
             raise ValueError(f"Unsupported dtype {self.dtype}; expected a Neuroglancer-supported numeric type")
+        self.gains = (np.asarray(config.gains, dtype=np.float64)
+                      if config.gains is not None else None)
         self.ndim = len(self.axis_names)
         nlevels = len(source_specs[0][1])
         if any(len(spec[1]) != nlevels for spec in source_specs):
@@ -160,14 +180,20 @@ class VirtualMosaic:
         base_scale, _ = _transforms(source_specs[0][1][0], self.ndim)
         for k in range(nlevels):
             sources = tuple(spec[0][k] for spec in source_specs)
-            tile_shape = tuple(int(v) for v in sources[0].shape)
+            tile_shapes = tuple(tuple(int(v) for v in source.shape) for source in sources)
+            tile_shape = tuple(max(s[d] for s in tile_shapes) for d in range(self.ndim))
             scale0, translation0 = _transforms(source_specs[0][1][k], self.ndim)
             for i, spec in enumerate(source_specs):
                 source = spec[0][k]
-                if tuple(source.shape) != tile_shape or np.dtype(source.dtype) != self.dtype:
-                    raise ValueError(f"Tile {i}, level {k}: shape/dtype differs from tile 0")
-                if len(source.shape) != self.ndim:
+                tile_shape_i = tile_shapes[i]
+                if len(tile_shape_i) != self.ndim:
                     raise ValueError(f"Tile {i}, level {k}: array dimensionality differs from metadata")
+                if np.dtype(source.dtype) != self.dtype:
+                    raise ValueError(f"Tile {i}, level {k}: dtype {source.dtype} differs from {self.dtype}")
+                if (tile_shape_i[:self.ndim - 3] != tile_shapes[0][:self.ndim - 3]
+                        or tile_shape_i[-2:] != tile_shapes[0][-2:]):
+                    raise ValueError(
+                        f"Tile {i}, level {k}: non-z shape {tile_shape_i} differs from tile 0 {tile_shapes[0]}")
                 scale_i, _ = _transforms(spec[1][k], self.ndim)
                 if not np.allclose(scale_i, scale0, rtol=1e-7, atol=1e-9):
                     raise ValueError(f"Tile {i}, level {k}: pixel scale differs from tile 0")
@@ -194,7 +220,7 @@ class VirtualMosaic:
             feather_yx = tuple(
                 max(0.0, tile_shape[-2 + j] * config.overlap_yx[j]) for j in range(2)
             )
-            self.levels.append(Level(sources, tile_shape, output_shape, chunk_shape,
+            self.levels.append(Level(sources, tile_shape, tile_shapes, output_shape, chunk_shape,
                                      origins, lo, tuple(scale0), tuple(translation0),
                                      feather_yx))
 
@@ -266,6 +292,8 @@ class VirtualMosaic:
                 for i, lev in enumerate(self.levels)
             ],
             "blend": self.config.blend,
+            "gains": (None if self.gains is None
+                      else [float(self.gains.min()), float(self.gains.max())]),
             "compression": "gzip" if self.config.gzip_level else "bytes",
         }
 
@@ -330,8 +358,9 @@ class VirtualMosaic:
             covered = np.zeros(level.chunk_shape, dtype=bool) if blend == "first" else None
 
         for tile_index, (origin, source) in enumerate(zip(level.origins_zyx, level.sources)):
+            tile_shape_i = level.tile_shapes[tile_index]
             tile_start = (0,) * (self.ndim - 3) + origin
-            tile_end = tuple(tile_start[d] + level.tile_shape[d] for d in range(self.ndim))
+            tile_end = tuple(tile_start[d] + tile_shape_i[d] for d in range(self.ndim))
             intersection_start = tuple(max(out_start[d], tile_start[d]) for d in range(self.ndim))
             intersection_end = tuple(min(out_end[d], tile_end[d]) for d in range(self.ndim))
             if any(b <= a for a, b in zip(intersection_start, intersection_end)):
@@ -344,6 +373,14 @@ class VirtualMosaic:
             expected_shape = tuple(b-a for a, b in zip(intersection_start, intersection_end))
             if patch.shape != expected_shape:
                 raise ValueError(f"Tile {tile_index} returned wrong patch shape: {patch.shape} != {expected_shape}")
+
+            if self.gains is not None:
+                gain = self.gains[tile_index]
+                if gain != 1.0:
+                    if blend == "feather":
+                        patch = patch.astype(np.float64, copy=False) * gain
+                    else:
+                        patch = _quantize(patch.astype(np.float64) * gain, self.dtype)
 
             if blend == "last":
                 out[out_slice] = patch
@@ -361,7 +398,7 @@ class VirtualMosaic:
                         continue
                     local_indices = np.arange(src_slice[axis].start,
                                               src_slice[axis].stop, dtype=np.float64)
-                    n = level.tile_shape[axis]
+                    n = tile_shape_i[axis]
                     ramp = np.minimum(1.0, np.minimum(
                         (local_indices + 0.5) / width,
                         (n - local_indices - 0.5) / width,

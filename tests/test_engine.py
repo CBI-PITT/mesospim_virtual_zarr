@@ -122,8 +122,65 @@ def test_source_arrays_not_mutated():
 
 def test_reject_unsupported_dtype_and_shapes():
     groups = make_groups()
-    groups[1].arrays['0'] = type(groups[1].arrays['0'])(np.zeros((1,1,3,4,4), dtype=np.uint16))
-    with pytest.raises(ValueError, match='shape/dtype'):
+    groups[1].arrays['0'] = type(groups[1].arrays['0'])(np.zeros((1,1,2,5,4), dtype=np.uint16))
+    with pytest.raises(ValueError, match='non-z shape'):
+        build(groups)
+    groups = make_groups()
+    groups[1].arrays['0'] = type(groups[1].arrays['0'])(np.zeros((1,1,2,4,4), dtype=np.uint8))
+    with pytest.raises(ValueError, match='dtype'):
         build(groups)
     with pytest.raises(ValueError, match='Expected 1 tiles'):
         build(rows=1, cols=1)
+
+
+def test_gain_last_first_and_feather_blends():
+    gains = (1.0, 2.0, 0.5, 1.0)
+    last = build(blend='last', gains=gains)
+    first = build(blend='first', gains=gains)
+    feather = build(blend='feather', gains=gains)
+    assert last.describe()['gains'] == [0.5, 2.0]
+    chunk = last.compose_chunk(0, (0,0,0,0,0))
+    assert chunk[0,0,0,0,0] == 10
+    assert chunk[0,0,0,3,0] == 40
+    assert chunk[0,0,0,0,3] == 15
+    assert chunk[0,0,0,3,3] == 40
+    chunk = first.compose_chunk(0, (0,0,0,0,0))
+    assert chunk[0,0,0,3,0] == 10
+    chunk = first.compose_chunk(0, (0,0,0,0,1))
+    assert chunk[0,0,0,0,0] == 15
+    chunk = feather.compose_chunk(0, (0,0,0,0,0))
+    assert chunk[0,0,0,0,0] == 10
+    assert chunk[0,0,0,3,0] == 25
+
+
+def test_gain_clipped_to_dtype_range():
+    groups = make_groups(tile_values=(60000, 60000, 60000, 60000))
+    m = build(groups, blend='last', gains=(2.0, 1.0, 1.0, 1.0))
+    chunk = m.compose_chunk(0, (0,0,0,0,0))
+    assert chunk[0,0,0,0,0] == 65535
+    assert chunk[0,0,0,3,0] == 60000
+
+
+def test_gain_one_applied_is_identity():
+    groups = make_groups()
+    plain = build(groups, blend='last')
+    gained = build(make_groups(), blend='last', gains=(1.0, 1.0, 1.0, 1.0))
+    for coords in ((0,0,0,0,0), (0,0,0,0,1)):
+        np.testing.assert_array_equal(plain.compose_chunk(0, coords),
+                                      gained.compose_chunk(0, coords))
+
+
+def test_allows_differing_z_extent():
+    groups = make_groups(shape=(1, 1, 4, 4, 4), multiscale=True)
+    groups[1].arrays['0'] = type(groups[1].arrays['0'])(np.full((1, 1, 3, 4, 4), 20, dtype=np.uint16))
+    groups[1].arrays['1'] = type(groups[1].arrays['0'])(np.full((1, 1, 1, 2, 2), 20, dtype=np.uint16))
+    m = build(groups, blend='last', chunk_shape_zyx=(2, 4, 4))
+    assert m.levels[0].shape == (1, 1, 4, 7, 7)
+    assert m.levels[1].shape == (1, 1, 2, 4, 4)
+    chunk = m.compose_chunk(0, (0, 0, 1, 0, 0))
+    assert chunk[0, 0, 0, 3, 0] == 20
+    assert chunk[0, 0, 1, 3, 0] == 10
+    assert chunk[0, 0, 1, 0, 0] == 10
+    chunk = m.compose_chunk(1, (0, 0, 0, 0, 0))
+    assert chunk[0, 0, 0, 2, 0] == 20
+    assert chunk[0, 0, 1, 2, 0] == 0

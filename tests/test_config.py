@@ -102,3 +102,82 @@ def test_from_json_raises_on_multichannel(tmp_path):
            "rows": 2, "cols": 2}
     with pytest.raises(ValueError, match="load_mosaic_configs"):
         MosaicConfig.from_json(write_manifest(tmp_path, cfg))
+
+
+def write_gain_file(tmp_path, data):
+    path = tmp_path / "gain.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def test_gain_json_auto_discovery_single_channel(tmp_path):
+    tiles = [f"/store/Tile{i}.ome.zarr" for i in range(4)]
+    gains = [1.0, 1.33, 0.5, 2.0]
+    write_gain_file(tmp_path, {"acquisition": "store",
+                               "channels": [{"name": "Ch488", "gains": gains}]})
+    configs = load_mosaic_configs(write_manifest(tmp_path, {"tiles": tiles, "rows": 2, "cols": 2}))
+    assert configs[0].gains == (1.0, 1.33, 0.5, 2.0)
+
+
+def test_gain_json_auto_discovery_multichannel(tmp_path):
+    cfg = {"channels": [{"name": "Ch488", "tiles": ["/d/Tile0.ome.zarr"] * 4},
+                        {"name": "Ch561", "tiles": ["/d/Tile0.ome.zarr"] * 4}],
+           "rows": 2, "cols": 2}
+    write_gain_file(tmp_path, {"acquisition": "d",
+                               "channels": [{"name": "Ch488", "gains": [1.0] * 4},
+                                            {"name": "Ch561", "gains": [1.33] * 4}]})
+    configs = load_mosaic_configs(write_manifest(tmp_path, cfg))
+    assert configs[0].gains == (1.0, 1.0, 1.0, 1.0)
+    assert configs[1].gains == (1.33,) * 4
+
+
+def test_no_gain_json_means_no_gains(tmp_path):
+    tiles = [f"/data/Tile{i}.ome.zarr" for i in range(4)]
+    configs = load_mosaic_configs(write_manifest(tmp_path, {"tiles": tiles, "rows": 2, "cols": 2}))
+    assert configs[0].gains is None
+
+
+def test_gain_json_wrong_count_rejected(tmp_path):
+    tiles = [f"/data/Tile{i}.ome.zarr" for i in range(4)]
+    write_gain_file(tmp_path, {"channels": [{"name": "Ch488", "gains": [1.0] * 3}]})
+    with pytest.raises(ValueError, match="expected 4 gains"):
+        load_mosaic_configs(write_manifest(tmp_path, {"tiles": tiles, "rows": 2, "cols": 2}))
+
+
+def test_gain_json_out_of_range_rejected(tmp_path):
+    tiles = [f"/data/Tile{i}.ome.zarr" for i in range(4)]
+    write_gain_file(tmp_path, {"channels": [{"name": "Ch488", "gains": [200.0] + [1.0] * 3}]})
+    with pytest.raises(ValueError, match=r"\[0\.01, 100"):
+        load_mosaic_configs(write_manifest(tmp_path, {"tiles": tiles, "rows": 2, "cols": 2}))
+
+
+def test_gain_json_multichannel_missing_channel_rejected(tmp_path):
+    cfg = {"channels": [{"name": "Ch488", "tiles": ["/d/Tile0.ome.zarr"] * 4},
+                        {"name": "Ch561", "tiles": ["/d/Tile0.ome.zarr"] * 4}],
+           "rows": 2, "cols": 2}
+    write_gain_file(tmp_path, {"channels": [{"name": "Ch488", "gains": [1.0] * 4}]})
+    with pytest.raises(ValueError, match="no gains for channel 'Ch561'"):
+        load_mosaic_configs(write_manifest(tmp_path, cfg))
+
+
+def test_gain_json_multiple_entries_single_channel_rejected(tmp_path):
+    tiles = [f"/data/Tile{i}.ome.zarr" for i in range(4)]
+    write_gain_file(tmp_path, {"channels": [{"name": "Ch488", "gains": [1.0] * 4},
+                                            {"name": "Ch561", "gains": [1.0] * 4}]})
+    with pytest.raises(ValueError, match="exactly one channels entry"):
+        load_mosaic_configs(write_manifest(tmp_path, {"tiles": tiles, "rows": 2, "cols": 2}))
+
+
+def test_gain_json_acquisition_mismatch_rejected(tmp_path):
+    tiles = [f"/store/Tile{i}.ome.zarr" for i in range(4)]
+    write_gain_file(tmp_path, {"acquisition": "other_store",
+                               "channels": [{"name": "Ch488", "gains": [1.0] * 4}]})
+    with pytest.raises(ValueError, match="does not match tile store"):
+        load_mosaic_configs(write_manifest(tmp_path, {"tiles": tiles, "rows": 2, "cols": 2}))
+
+
+def test_gain_json_invalid_json_rejected(tmp_path):
+    tiles = [f"/data/Tile{i}.ome.zarr" for i in range(4)]
+    (tmp_path / "gain.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="Could not read"):
+        load_mosaic_configs(write_manifest(tmp_path, {"tiles": tiles, "rows": 2, "cols": 2}))
