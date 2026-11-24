@@ -10,6 +10,8 @@ It includes:
 - `VirtualMosaic` — tile geometry, multiscale transforms and chunk compositing
 - `VirtualZarrV3Store` — native read-only Zarr-Python 3 `Store` implementation
 - FastAPI server — serves the exact same virtual keys to Neuroglancer via HTTP
+- Multi-dataset service — serves many datasets' virtual keys plus a local
+  Neuroglancer client from one process for the micro_status web app (section 4a)
 - Imaris exporter — writes one IMS from the same virtual compositing engine without a server
 - Multi-channel manifests: one virtual mosaic per channel, one colored
   Neuroglancer layer per channel with per-channel display windows
@@ -182,6 +184,38 @@ network-accessible HTTPS gateway.
 **Security:** The demo server sends `Access-Control-Allow-Origin: *`. Bind to
 `127.0.0.1` unless you have authentication/authorization and HTTPS in place.
 Never expose private microscopy data to an unauthenticated public endpoint.
+
+### 4a. Multi-dataset service for the micro_status web app
+
+Instead of one `mesospim-virtual-zarr` process per dataset, a single service
+serves read-only virtual mosaics for every dataset managed by the
+[micro_status web app](https://github.com/CBI-PITT), plus a local Neuroglancer
+client, from one long-running process:
+
+```bash
+python -m virtual_mesospim.service --token-secret <web-app-secret-key> --port 1415
+```
+
+- The web app signs an expiring per-dataset token with its Flask secret key and
+  redirects to `/datasets/<id>/viewer?token=...`; the service verifies the token
+  (same `--token-secret`) before reading `mosaic.json`, `gain.json` or any tile
+  in the signed dataset directory, and refuses requests for other datasets.
+- `/datasets/<id>/viewer` redirects to the bundled Neuroglancer client at
+  `/v/viewer/` with one image layer per channel, a zoomed-out single-panel (XY)
+  initial view showing the whole dataset at a coarse pyramid level, an initial
+  position on the middle z/y/x plane of the volume and per-channel display
+  windows. The bundled client is the
+  python-integration build, which requires a `/v/<token>/` URL path segment to
+  initialize; a cosmetic "Connecting to Python server" status may appear at the
+  bottom and is safe to ignore. The client comes from the
+  `neuroglancer` package (`pip install neuroglancer`) or `--client-dir`.
+- Zarr v3 keys are served at `/datasets/<id>/<mount_path>[/<channel>]/...` and
+  require the same token; the token is carried in each layer source URL and is
+  propagated by Neuroglancer to every chunk request.
+- Datasets stay loaded in a bounded RAM cache (`--max-datasets`) invalidated
+  when the manifest or the auto-discovered `gain.json` changes on disk.
+- The viewer page and its data share one origin, so no CORS configuration is
+  needed; bind the service to the LAN host the web app is reached on.
 
 ## 5. Read via Zarr-Python 3
 

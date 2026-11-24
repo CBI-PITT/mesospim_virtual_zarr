@@ -21,6 +21,7 @@ test = ["pytest>=7", "httpx>=0.24", "numcodecs>=0.13"]
 [project.scripts]
 mesospim-virtual-zarr = "virtual_mesospim.cli:main"
 mesospim-virtual-zarr-to-ims = "virtual_mesospim.export_ims:main"
+mesospim-virtual-zarr-service = "virtual_mesospim.service:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
