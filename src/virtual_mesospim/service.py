@@ -293,10 +293,14 @@ def create_service_app(token_secret: str, client_dir: Path | None = None,
                 entry.window = _display_window_sampled(entry.mosaic)
         # The token rides in the path: Neuroglancer appends chunk keys directly
         # to the namespace URL, which corrupts query-string tokens.
-        data_base = (f"{str(request.base_url).rstrip('/')}"
+        # The service may be mounted inside another ASGI app. base_url points
+        # at the outer app; root_path includes the service mount prefix.
+        prefix = request.scope.get("root_path", "").rstrip("/")
+        data_base = (f"{request.url.scheme}://{request.url.netloc}{prefix}"
                      f"/t/{token}/datasets/{dataset_id}/{entries[0].mosaic.config.mount_path}")
         state = _viewer_state(entries, data_base)
-        url = f"/v/viewer/index.html#!{quote(json.dumps(state, separators=(',', ':')), safe='')}"
+        url = (f"{prefix}/v/viewer/index.html#!"
+               f"{quote(json.dumps(state, separators=(',', ':')), safe='')}")
         return RedirectResponse(url, status_code=302)
 
     # Registered after /viewer so the viewer route matches first.

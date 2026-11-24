@@ -5,6 +5,7 @@ from urllib.parse import unquote
 import httpx
 import pytest
 import zarr
+from fastapi import FastAPI
 
 from virtual_mesospim.service import create_service_app, sign_token, verify_token
 
@@ -106,6 +107,34 @@ def test_viewer_redirect_and_layers(tmp_path):
             # Position is in voxel coordinates: the middle z/y/x plane of the
             # 2 x 20 x 20 voxel volume.
             assert state['position'] == pytest.approx([1, 10, 10])
+
+    asyncio.run(run())
+
+
+def test_mounted_viewer_redirect_and_chunks(tmp_path):
+    root = build_dataset(tmp_path / 'dataset')
+    client_dir = tmp_path / 'client'
+    client_dir.mkdir()
+    (client_dir / 'index.html').write_text('<html>Neuroglancer</html>')
+    app = FastAPI()
+    app.mount('/virtual-zarr', create_service_app(SECRET, client_dir))
+    token = sign_token(SECRET, 1, str(root), 3600)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            response = await client.get('/virtual-zarr/datasets/1/viewer',
+                                        params={'token': token})
+            assert response.status_code == 302
+            location = response.headers['location']
+            assert location.startswith('/virtual-zarr/v/viewer/index.html#!')
+            state = json.loads(unquote(location.split('#!', 1)[1]))
+            source = state['layers'][0]['source']
+            assert source == (f'http://test/virtual-zarr/t/{token}/datasets/1/'
+                              'stitched.ome.zarr/Ch488/|zarr3:')
+            assert (await client.get('/virtual-zarr/v/viewer/index.html')).status_code == 200
+            assert (await client.get(source.split('/|zarr3:', 1)[0] + '/zarr.json')).status_code == 200
+            assert (await client.get(source.split('/|zarr3:', 1)[0] + '/0/c/0/0/0')).status_code == 200
 
     asyncio.run(run())
 
